@@ -74,6 +74,12 @@ To stop:
 launchctl unload ~/Library/LaunchAgents/com.presence.daemon.plist
 ```
 
+## Update started daemon (after rebuild)
+```bash
+launchctl unload ~/Library/LaunchAgents/com.presence.daemon.plist
+launchctl load ~/Library/LaunchAgents/com.presence.daemon.plist
+```
+
 ## How it works
 
 1. On each Friday trigger, the LLM (Qwen3-0.6B, Q4 quantized via mistral.rs) generates varied lunch break times as structured JSON

@@ -41,8 +41,8 @@ async fn run_pipeline(cfg: &config::Config, llm: &llm::Llm) -> Result<()> {
 
     info!("notifying Telegram...");
     let tg_msg = format!(
-        "Feuille de présence envoyée.\nDestinataires: {}, {}",
-        cfg.recipient_1, cfg.recipient_2
+        "Feuille de présence envoyée.\nDestinataires: {}, {}\n\n{}",
+        cfg.recipient_1, cfg.recipient_2, mail_body
     );
     telegram::notify(&cfg.telegram_bot_token, &cfg.telegram_chat_id, &tg_msg).await?;
 
