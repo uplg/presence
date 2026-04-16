@@ -1,4 +1,4 @@
-use chrono::NaiveDate;
+use chrono::{Datelike, NaiveDate};
 
 /// Compute Easter Sunday for a given year using the Anonymous Gregorian algorithm.
 fn easter(year: i32) -> NaiveDate {
@@ -50,28 +50,138 @@ pub fn is_holiday(date: NaiveDate) -> Option<&'static str> {
         .map(|(_, name)| name)
 }
 
-use chrono::Datelike;
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn d(y: i32, m: u32, day: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, day).unwrap()
+    }
+
+    // --- Easter algorithm ---
+
     #[test]
-    fn test_easter_2026() {
-        // Easter 2026 is April 5
-        assert_eq!(easter(2026), NaiveDate::from_ymd_opt(2026, 4, 5).unwrap());
+    fn easter_2024() {
+        assert_eq!(easter(2024), d(2024, 3, 31));
     }
 
     #[test]
-    fn test_holidays_2026_count() {
-        assert_eq!(french_holidays(2026).len(), 11);
+    fn easter_2025() {
+        assert_eq!(easter(2025), d(2025, 4, 20));
     }
 
     #[test]
-    fn test_may_1_is_holiday() {
-        assert_eq!(
-            is_holiday(NaiveDate::from_ymd_opt(2026, 5, 1).unwrap()),
-            Some("Fête du Travail")
-        );
+    fn easter_2026() {
+        assert_eq!(easter(2026), d(2026, 4, 5));
+    }
+
+    #[test]
+    fn easter_2027() {
+        assert_eq!(easter(2027), d(2027, 3, 28));
+    }
+
+    #[test]
+    fn easter_2030() {
+        assert_eq!(easter(2030), d(2030, 4, 21));
+    }
+
+    // --- Holiday count ---
+
+    #[test]
+    fn always_11_holidays() {
+        for year in 2024..=2035 {
+            assert_eq!(french_holidays(year).len(), 11, "wrong count for {year}");
+        }
+    }
+
+    // --- Fixed holidays ---
+
+    #[test]
+    fn fixed_holidays_present_every_year() {
+        for year in 2024..=2030 {
+            let holidays = french_holidays(year);
+            let dates: Vec<NaiveDate> = holidays.iter().map(|(d, _)| *d).collect();
+
+            assert!(
+                dates.contains(&d(year, 1, 1)),
+                "missing Jour de l'An {year}"
+            );
+            assert!(
+                dates.contains(&d(year, 5, 1)),
+                "missing Fête du Travail {year}"
+            );
+            assert!(
+                dates.contains(&d(year, 5, 8)),
+                "missing Victoire 1945 {year}"
+            );
+            assert!(
+                dates.contains(&d(year, 7, 14)),
+                "missing Fête Nationale {year}"
+            );
+            assert!(dates.contains(&d(year, 8, 15)), "missing Assomption {year}");
+            assert!(dates.contains(&d(year, 11, 1)), "missing Toussaint {year}");
+            assert!(dates.contains(&d(year, 11, 11)), "missing Armistice {year}");
+            assert!(dates.contains(&d(year, 12, 25)), "missing Noël {year}");
+        }
+    }
+
+    // --- Easter-based holidays for specific years ---
+
+    #[test]
+    fn easter_based_2026() {
+        let holidays = french_holidays(2026);
+        let dates: Vec<NaiveDate> = holidays.iter().map(|(d, _)| *d).collect();
+
+        // Easter 2026 = April 5
+        assert!(dates.contains(&d(2026, 4, 6)), "missing Lundi de Pâques");
+        assert!(dates.contains(&d(2026, 5, 14)), "missing Ascension"); // Easter + 39
+        assert!(
+            dates.contains(&d(2026, 5, 25)),
+            "missing Lundi de Pentecôte"
+        ); // Easter + 50
+    }
+
+    #[test]
+    fn easter_based_2025() {
+        let holidays = french_holidays(2025);
+        let dates: Vec<NaiveDate> = holidays.iter().map(|(d, _)| *d).collect();
+
+        // Easter 2025 = April 20
+        assert!(dates.contains(&d(2025, 4, 21)), "missing Lundi de Pâques");
+        assert!(dates.contains(&d(2025, 5, 29)), "missing Ascension");
+        assert!(dates.contains(&d(2025, 6, 9)), "missing Lundi de Pentecôte");
+    }
+
+    // --- is_holiday ---
+
+    #[test]
+    fn is_holiday_returns_name() {
+        assert_eq!(is_holiday(d(2026, 5, 1)), Some("Fête du Travail"));
+        assert_eq!(is_holiday(d(2026, 12, 25)), Some("Noël"));
+        assert_eq!(is_holiday(d(2026, 4, 6)), Some("Lundi de Pâques"));
+    }
+
+    #[test]
+    fn is_holiday_returns_none_for_regular_day() {
+        assert_eq!(is_holiday(d(2026, 4, 16)), None); // random Wednesday
+        assert_eq!(is_holiday(d(2026, 6, 15)), None);
+    }
+
+    // --- No duplicate dates in a year ---
+
+    #[test]
+    fn no_duplicate_dates() {
+        for year in 2024..=2035 {
+            let holidays = french_holidays(year);
+            let dates: Vec<NaiveDate> = holidays.iter().map(|(d, _)| *d).collect();
+            let mut deduped = dates.clone();
+            deduped.sort();
+            deduped.dedup();
+            assert_eq!(
+                dates.len(),
+                deduped.len(),
+                "duplicate holiday dates in {year}"
+            );
+        }
     }
 }

@@ -68,10 +68,6 @@ impl Llm {
             .set_constraint(Constraint::JsonSchema(schema))
             .set_sampler_max_len(1024)
             .set_sampler_temperature(0.3)
-            .add_message(
-                TextMessageRole::System,
-                "Tu génères des horaires de pause déjeuner variés au format JSON. Les paires valides sont uniquement : 12h00→13h00, 12h30→13h30, 13h00→14h00, 13h30→14h30, 14h00→15h00. Varie les horaires entre les jours.",
-            )
             .add_message(TextMessageRole::User, prompt);
 
         let response = self.model.send_chat_request(request).await?;

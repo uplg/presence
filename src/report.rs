@@ -238,3 +238,274 @@ impl WeekReport {
         out
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn d(y: i32, m: u32, day: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, day).unwrap()
+    }
+
+    fn make_schedule(pairs: &[(&str, &str)]) -> LlmWeekOutput {
+        LlmWeekOutput {
+            days: pairs
+                .iter()
+                .map(|(s, e)| DaySchedule {
+                    lunch_start: s.to_string(),
+                    lunch_end: e.to_string(),
+                })
+                .collect(),
+        }
+    }
+
+    // --- fix_pairs ---
+
+    #[test]
+    fn fix_pairs_corrects_mismatched_end() {
+        let mut output = make_schedule(&[
+            ("12h00", "14h00"), // wrong end
+            ("13h30", "13h30"), // wrong end
+            ("14h00", "12h00"), // wrong end
+        ]);
+        output.fix_pairs();
+        assert_eq!(output.days[0].lunch_end, "13h00");
+        assert_eq!(output.days[1].lunch_end, "14h30");
+        assert_eq!(output.days[2].lunch_end, "15h00");
+    }
+
+    #[test]
+    fn fix_pairs_preserves_correct_pairs() {
+        let mut output = make_schedule(&[
+            ("12h00", "13h00"),
+            ("12h30", "13h30"),
+            ("13h00", "14h00"),
+            ("13h30", "14h30"),
+            ("14h00", "15h00"),
+        ]);
+        output.fix_pairs();
+        for (day, (_, expected_end)) in output.days.iter().zip(VALID_PAIRS.iter()) {
+            assert_eq!(day.lunch_end, *expected_end);
+        }
+    }
+
+    #[test]
+    fn fix_pairs_handles_unknown_start() {
+        let mut output = make_schedule(&[("11h00", "12h00")]);
+        output.fix_pairs();
+        // Unknown start falls back to "13h30"
+        assert_eq!(output.days[0].lunch_end, "13h30");
+    }
+
+    // --- validate ---
+
+    #[test]
+    fn validate_ok_with_valid_pairs() {
+        let output = make_schedule(&[("12h00", "13h00"), ("13h30", "14h30"), ("14h00", "15h00")]);
+        assert!(output.validate(3).is_ok());
+    }
+
+    #[test]
+    fn validate_fails_wrong_count() {
+        let output = make_schedule(&[("12h00", "13h00")]);
+        let err = output.validate(3).unwrap_err();
+        assert!(err.contains("expected 3 days, got 1"));
+    }
+
+    #[test]
+    fn validate_fails_invalid_pair() {
+        let output = make_schedule(&[("12h00", "14h00")]); // bad pairing
+        let err = output.validate(1).unwrap_err();
+        assert!(err.contains("invalid lunch pair"));
+    }
+
+    // --- week_days ---
+
+    #[test]
+    fn week_days_returns_5_days_mon_to_fri() {
+        // 2026-04-16 is a Wednesday
+        let days = week_days(d(2026, 4, 16));
+        assert_eq!(days.len(), 5);
+        assert_eq!(days[0].1, "Lundi");
+        assert_eq!(days[4].1, "Vendredi");
+        assert_eq!(days[0].0, d(2026, 4, 13)); // Monday
+        assert_eq!(days[4].0, d(2026, 4, 17)); // Friday
+    }
+
+    #[test]
+    fn week_days_from_friday_same_week() {
+        // Friday April 17 2026
+        let days = week_days(d(2026, 4, 17));
+        assert_eq!(days[0].0, d(2026, 4, 13)); // still Monday of same week
+    }
+
+    #[test]
+    fn week_days_from_monday() {
+        let days = week_days(d(2026, 4, 13));
+        assert_eq!(days[0].0, d(2026, 4, 13));
+    }
+
+    #[test]
+    fn week_days_detects_holiday() {
+        // Week of May 1 2026 (Friday)
+        let days = week_days(d(2026, 5, 1));
+        // May 1 is Fête du Travail (Friday = index 4)
+        assert!(days[4].2.is_some());
+        assert_eq!(days[4].2.unwrap(), "Fête du Travail");
+        // Other days should not be holidays
+        assert!(days[0].2.is_none());
+    }
+
+    // --- worked_day_count ---
+
+    #[test]
+    fn worked_day_count_normal_week() {
+        // Week of April 13 2026 — no holidays
+        assert_eq!(worked_day_count(d(2026, 4, 16)), 5);
+    }
+
+    #[test]
+    fn worked_day_count_with_holiday() {
+        // Week of May 1 2026 — Fête du Travail on Friday
+        assert_eq!(worked_day_count(d(2026, 5, 1)), 4);
+    }
+
+    #[test]
+    fn worked_day_count_ascension_week_2026() {
+        // Ascension 2026 = May 14 (Thursday)
+        assert_eq!(worked_day_count(d(2026, 5, 14)), 4);
+    }
+
+    // --- build_llm_prompt ---
+
+    #[test]
+    fn prompt_contains_day_count() {
+        let prompt = build_llm_prompt(d(2026, 4, 16));
+        assert!(prompt.contains("5 jours"));
+    }
+
+    #[test]
+    fn prompt_excludes_holiday_days() {
+        // May 1 2026 is Friday (Fête du Travail)
+        let prompt = build_llm_prompt(d(2026, 5, 1));
+        assert!(prompt.contains("4 jours"));
+        assert!(!prompt.contains("Vendredi")); // holiday day excluded from worked list
+    }
+
+    #[test]
+    fn prompt_contains_valid_pairs_example() {
+        let prompt = build_llm_prompt(d(2026, 4, 16));
+        assert!(prompt.contains("12h00"));
+        assert!(prompt.contains("13h30"));
+    }
+
+    // --- assemble ---
+
+    #[test]
+    fn assemble_normal_week() {
+        let schedule = make_schedule(&[
+            ("12h00", "13h00"),
+            ("12h30", "13h30"),
+            ("13h00", "14h00"),
+            ("13h30", "14h30"),
+            ("14h00", "15h00"),
+        ]);
+        let week = assemble(d(2026, 4, 16), &schedule);
+        assert_eq!(week.days.len(), 5);
+        assert_eq!(week.total_hours, 35);
+        assert_eq!(week.holiday_hours, 0);
+        assert!(week.days.iter().all(|d| d.holiday.is_none()));
+        assert!(week.days.iter().all(|d| d.schedule.is_some()));
+    }
+
+    #[test]
+    fn assemble_with_holiday() {
+        // May 1 2026 is Friday — Fête du Travail
+        let schedule = make_schedule(&[
+            ("12h00", "13h00"),
+            ("12h30", "13h30"),
+            ("13h00", "14h00"),
+            ("13h30", "14h30"),
+        ]);
+        let week = assemble(d(2026, 5, 1), &schedule);
+        assert_eq!(week.total_hours, 28); // 4 * 7
+        assert_eq!(week.holiday_hours, 7);
+        // Friday (index 4) should be holiday
+        assert!(week.days[4].holiday.is_some());
+        assert!(week.days[4].schedule.is_none());
+    }
+
+    // --- to_mail_body ---
+
+    #[test]
+    fn mail_body_format_normal_week() {
+        let schedule = make_schedule(&[
+            ("12h00", "13h00"),
+            ("12h30", "13h30"),
+            ("13h00", "14h00"),
+            ("13h30", "14h30"),
+            ("14h00", "15h00"),
+        ]);
+        let week = assemble(d(2026, 4, 16), &schedule);
+        let body = week.to_mail_body();
+
+        assert!(body.contains("Lundi 13 avril"));
+        assert!(body.contains("Vendredi 17 avril"));
+        assert!(body.contains("Pause déjeuner entre 12h00 et 13h00"));
+        assert!(body.contains("Temps de travail journalier : 7h."));
+        assert!(body.contains("TOTAL DURÉE DE TRAVAIL HEBDOMADAIRE : 35h"));
+        assert!(body.contains("TOTAL CONGES HEBDOMADAIRE : 0h"));
+    }
+
+    #[test]
+    fn mail_body_format_with_holiday() {
+        let schedule = make_schedule(&[
+            ("12h00", "13h00"),
+            ("12h30", "13h30"),
+            ("13h00", "14h00"),
+            ("13h30", "14h30"),
+        ]);
+        let week = assemble(d(2026, 5, 1), &schedule);
+        let body = week.to_mail_body();
+
+        assert!(body.contains("Férié"));
+        assert!(body.contains("Fête du Travail"));
+        assert!(body.contains("TOTAL DURÉE DE TRAVAIL HEBDOMADAIRE : 28h"));
+        assert!(body.contains("TOTAL CONGES HEBDOMADAIRE : 7h"));
+    }
+
+    #[test]
+    fn mail_body_no_greetings() {
+        let schedule = make_schedule(&[
+            ("12h00", "13h00"),
+            ("12h30", "13h30"),
+            ("13h00", "14h00"),
+            ("13h30", "14h30"),
+            ("14h00", "15h00"),
+        ]);
+        let week = assemble(d(2026, 4, 16), &schedule);
+        let body = week.to_mail_body();
+
+        // Must NOT contain greetings or signature
+        assert!(!body.contains("Bonjour"));
+        assert!(!body.contains("Cordialement"));
+        assert!(!body.contains("Bonne"));
+        // Must start directly with "Lundi"
+        assert!(body.starts_with("Lundi"));
+    }
+
+    #[test]
+    fn mail_body_uses_correct_month_across_boundary() {
+        // Week containing Jan 1 2027 (Friday) — the month used should be from Monday Dec 28
+        let schedule = make_schedule(&[
+            ("12h00", "13h00"),
+            ("12h30", "13h30"),
+            ("13h00", "14h00"),
+            ("13h30", "14h30"),
+        ]);
+        let week = assemble(d(2027, 1, 1), &schedule);
+        let body = week.to_mail_body();
+        // Month is derived from first day (Monday Dec 28)
+        assert!(body.contains("décembre"));
+    }
+}
