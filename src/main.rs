@@ -89,8 +89,7 @@ async fn main() -> Result<()> {
     let cfg = Arc::new(cfg);
     let cfg_clone = cfg.clone();
 
-    sched
-        .add(Job::new_async("0 10 17 * * FRI", move |_uuid, _lock| {
+    let job = Job::new_async_tz("0 10 17 * * FRI", chrono_tz::Europe::Paris, move |_uuid, _lock| {
             let cfg = cfg_clone.clone();
             Box::pin(async move {
                 let delay = rand::rng().random_range(0u64..1200);
@@ -109,12 +108,76 @@ async fn main() -> Result<()> {
                     error!("pipeline failed: {e:#}");
                 }
             })
-        })?)
-        .await?;
+        })?;
+    sched.add(job).await?;
 
     sched.start().await?;
     info!("scheduler running. Ctrl+C to stop.");
     tokio::signal::ctrl_c().await?;
     info!("shutting down");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::{NaiveDate, NaiveTime, TimeZone, Timelike};
+    use chrono_tz::Europe::Paris;
+
+    /// Verify that 17:10 Europe/Paris maps to the correct UTC hour,
+    /// accounting for CET (winter, UTC+1) vs CEST (summer, UTC+2).
+    #[test]
+    fn friday_1710_paris_to_utc_summer() {
+        // 2026-06-19 is a Friday in summer (CEST, UTC+2)
+        let paris_dt = Paris
+            .from_local_datetime(
+                &NaiveDate::from_ymd_opt(2026, 6, 19)
+                    .unwrap()
+                    .and_time(NaiveTime::from_hms_opt(17, 10, 0).unwrap()),
+            )
+            .unwrap();
+        let utc = paris_dt.with_timezone(&chrono::Utc);
+        assert_eq!(utc.time().hour(), 15, "17:10 CEST should be 15:10 UTC");
+        assert_eq!(utc.time().minute(), 10);
+    }
+
+    #[test]
+    fn friday_1710_paris_to_utc_winter() {
+        // 2026-01-16 is a Friday in winter (CET, UTC+1)
+        let paris_dt = Paris
+            .from_local_datetime(
+                &NaiveDate::from_ymd_opt(2026, 1, 16)
+                    .unwrap()
+                    .and_time(NaiveTime::from_hms_opt(17, 10, 0).unwrap()),
+            )
+            .unwrap();
+        let utc = paris_dt.with_timezone(&chrono::Utc);
+        assert_eq!(utc.time().hour(), 16, "17:10 CET should be 16:10 UTC");
+        assert_eq!(utc.time().minute(), 10);
+    }
+
+    #[test]
+    fn paris_offset_differs_summer_vs_winter() {
+        let summer = Paris
+            .from_local_datetime(
+                &NaiveDate::from_ymd_opt(2026, 7, 1)
+                    .unwrap()
+                    .and_time(NaiveTime::from_hms_opt(12, 0, 0).unwrap()),
+            )
+            .unwrap();
+        let winter = Paris
+            .from_local_datetime(
+                &NaiveDate::from_ymd_opt(2026, 12, 1)
+                    .unwrap()
+                    .and_time(NaiveTime::from_hms_opt(12, 0, 0).unwrap()),
+            )
+            .unwrap();
+
+        let summer_utc = summer.with_timezone(&chrono::Utc);
+        let winter_utc = winter.with_timezone(&chrono::Utc);
+
+        // Summer: UTC+2 → 12h Paris = 10h UTC
+        // Winter: UTC+1 → 12h Paris = 11h UTC
+        assert_eq!(summer_utc.time().hour(), 10);
+        assert_eq!(winter_utc.time().hour(), 11);
+    }
 }
