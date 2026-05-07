@@ -205,9 +205,9 @@ impl WeekReport {
     /// Format to the exact mail body template.
     pub fn to_mail_body(&self) -> String {
         let mut out = String::new();
-        let month_name = french_month(self.days[0].date.month());
 
         for day in &self.days {
+            let month_name = french_month(day.date.month());
             if let Some(holiday_name) = day.holiday {
                 out.push_str(&format!(
                     "{} {} {} - Férié ({}). Temps de travail journalier : 0h. \n",
@@ -495,8 +495,9 @@ mod tests {
     }
 
     #[test]
-    fn mail_body_uses_correct_month_across_boundary() {
-        // Week containing Jan 1 2027 (Friday) — the month used should be from Monday Dec 28
+    fn mail_body_uses_per_day_month_across_boundary() {
+        // Week containing Jan 1 2027 (Friday): Mon Dec 28 → Fri Jan 1.
+        // Each day must show its own month, not Monday's.
         let schedule = make_schedule(&[
             ("12h00", "13h00"),
             ("12h30", "13h30"),
@@ -505,7 +506,28 @@ mod tests {
         ]);
         let week = assemble(d(2027, 1, 1), &schedule);
         let body = week.to_mail_body();
-        // Month is derived from first day (Monday Dec 28)
-        assert!(body.contains("décembre"));
+        assert!(body.contains("Lundi 28 décembre"));
+        assert!(body.contains("Mardi 29 décembre"));
+        assert!(body.contains("Mercredi 30 décembre"));
+        assert!(body.contains("Jeudi 31 décembre"));
+        assert!(body.contains("Vendredi 1 janvier"));
+    }
+
+    #[test]
+    fn mail_body_april_to_may_2026_no_april_1_for_labour_day() {
+        // Reproduces the prod bug: week of May 1 2026 (Fête du Travail Friday)
+        // spans Mon Apr 27 → Fri May 1. May 1 must show "1 mai", not "1 avril".
+        let schedule = make_schedule(&[
+            ("12h00", "13h00"),
+            ("12h30", "13h30"),
+            ("13h00", "14h00"),
+            ("13h30", "14h30"),
+        ]);
+        let week = assemble(d(2026, 5, 1), &schedule);
+        let body = week.to_mail_body();
+        assert!(body.contains("Jeudi 30 avril"));
+        assert!(body.contains("Vendredi 1 mai"));
+        assert!(body.contains("Fête du Travail"));
+        assert!(!body.contains("1 avril"));
     }
 }
