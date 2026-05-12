@@ -10,20 +10,28 @@ pub struct DaySchedule {
     pub lunch_end: String,   // e.g. "13h30"
 }
 
+/// How a single day is categorised in the weekly report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DayKind {
+    Worked,
+    Holiday(&'static str),
+    Off, // personal off day (congé)
+}
+
 /// Full generated report for one day.
 #[derive(Debug, Clone)]
 pub struct DayReport {
     pub date: NaiveDate,
     pub weekday_name: &'static str,
-    pub holiday: Option<&'static str>,
-    pub schedule: Option<DaySchedule>, // None if holiday
+    pub kind: DayKind,
+    pub schedule: Option<DaySchedule>, // Some only when kind == Worked
 }
 
 #[derive(Debug, Clone)]
 pub struct WeekReport {
     pub days: Vec<DayReport>,
     pub total_hours: u32,
-    pub holiday_hours: u32,
+    pub off_hours: u32, // holidays + personal off days
 }
 
 /// The JSON structure we ask the LLM to produce.
@@ -110,34 +118,45 @@ fn french_month(m: u32) -> &'static str {
     }
 }
 
-/// Returns (monday, list of (date, weekday_name, Option<holiday_name>)) for the week containing `date`.
-pub fn week_days(date: NaiveDate) -> Vec<(NaiveDate, &'static str, Option<&'static str>)> {
+/// Classify each Mon-Fri of the week containing `date`. Public holidays take
+/// precedence over personal off days (so a day that is both still shows the
+/// holiday name).
+pub fn week_days(
+    date: NaiveDate,
+    personal_off: &[NaiveDate],
+) -> Vec<(NaiveDate, &'static str, DayKind)> {
     let weekday_num = date.weekday().num_days_from_monday();
     let monday = date - Duration::days(weekday_num as i64);
 
     (0..5)
         .map(|i| {
             let day = monday + Duration::days(i);
-            let holiday = holidays::is_holiday(day);
-            (day, weekday_name(day.weekday()), holiday)
+            let kind = if let Some(name) = holidays::is_holiday(day) {
+                DayKind::Holiday(name)
+            } else if personal_off.contains(&day) {
+                DayKind::Off
+            } else {
+                DayKind::Worked
+            };
+            (day, weekday_name(day.weekday()), kind)
         })
         .collect()
 }
 
-/// Count how many worked (non-holiday) days this week.
-pub fn worked_day_count(date: NaiveDate) -> usize {
-    week_days(date)
+/// Count how many worked (non-holiday, non-off) days this week.
+pub fn worked_day_count(date: NaiveDate, personal_off: &[NaiveDate]) -> usize {
+    week_days(date, personal_off)
         .iter()
-        .filter(|(_, _, h)| h.is_none())
+        .filter(|(_, _, k)| matches!(k, DayKind::Worked))
         .count()
 }
 
 /// Build the prompt that asks the LLM to produce JSON with variable lunch breaks.
-pub fn build_llm_prompt(date: NaiveDate) -> String {
-    let days = week_days(date);
+pub fn build_llm_prompt(date: NaiveDate, personal_off: &[NaiveDate]) -> String {
+    let days = week_days(date, personal_off);
     let worked: Vec<&str> = days
         .iter()
-        .filter(|(_, _, h)| h.is_none())
+        .filter(|(_, _, k)| matches!(k, DayKind::Worked))
         .map(|(_, name, _)| *name)
         .collect();
 
@@ -161,24 +180,20 @@ Exemple pour 2 jours :
 }
 
 /// Assemble a WeekReport from the week dates + LLM-generated schedules.
-pub fn assemble(date: NaiveDate, llm_output: &LlmWeekOutput) -> WeekReport {
-    let days_info = week_days(date);
+pub fn assemble(
+    date: NaiveDate,
+    personal_off: &[NaiveDate],
+    llm_output: &LlmWeekOutput,
+) -> WeekReport {
+    let days_info = week_days(date, personal_off);
     let mut schedule_iter = llm_output.days.iter();
     let mut total_hours = 0u32;
-    let mut holiday_hours = 0u32;
+    let mut off_hours = 0u32;
 
     let days: Vec<DayReport> = days_info
         .into_iter()
-        .map(|(d, name, holiday)| {
-            if holiday.is_some() {
-                holiday_hours += 7;
-                DayReport {
-                    date: d,
-                    weekday_name: name,
-                    holiday,
-                    schedule: None,
-                }
-            } else {
+        .map(|(d, name, kind)| match kind {
+            DayKind::Worked => {
                 total_hours += 7;
                 let sched = schedule_iter.next().cloned().unwrap_or(DaySchedule {
                     lunch_start: "12h30".into(),
@@ -187,8 +202,17 @@ pub fn assemble(date: NaiveDate, llm_output: &LlmWeekOutput) -> WeekReport {
                 DayReport {
                     date: d,
                     weekday_name: name,
-                    holiday: None,
+                    kind: DayKind::Worked,
                     schedule: Some(sched),
+                }
+            }
+            other => {
+                off_hours += 7;
+                DayReport {
+                    date: d,
+                    weekday_name: name,
+                    kind: other,
+                    schedule: None,
                 }
             }
         })
@@ -197,7 +221,7 @@ pub fn assemble(date: NaiveDate, llm_output: &LlmWeekOutput) -> WeekReport {
     WeekReport {
         days,
         total_hours,
-        holiday_hours,
+        off_hours,
     }
 }
 
@@ -208,23 +232,36 @@ impl WeekReport {
 
         for day in &self.days {
             let month_name = french_month(day.date.month());
-            if let Some(holiday_name) = day.holiday {
-                out.push_str(&format!(
-                    "{} {} {} - Férié ({}). Temps de travail journalier : 0h. \n",
-                    day.weekday_name,
-                    day.date.day(),
-                    month_name,
-                    holiday_name,
-                ));
-            } else if let Some(sched) = &day.schedule {
-                out.push_str(&format!(
-                    "{} {} {} - Durée de ma journée de travail : 9h à 17h. Pause déjeuner entre {} et {}. Temps de travail journalier : 7h. \n",
-                    day.weekday_name,
-                    day.date.day(),
-                    month_name,
-                    sched.lunch_start,
-                    sched.lunch_end,
-                ));
+            match &day.kind {
+                DayKind::Holiday(name) => {
+                    out.push_str(&format!(
+                        "{} {} {} - Férié ({}). Temps de travail journalier : 0h. \n",
+                        day.weekday_name,
+                        day.date.day(),
+                        month_name,
+                        name,
+                    ));
+                }
+                DayKind::Off => {
+                    out.push_str(&format!(
+                        "{} {} {} - Congé. Temps de travail journalier : 0h. \n",
+                        day.weekday_name,
+                        day.date.day(),
+                        month_name,
+                    ));
+                }
+                DayKind::Worked => {
+                    if let Some(sched) = &day.schedule {
+                        out.push_str(&format!(
+                            "{} {} {} - Durée de ma journée de travail : 9h à 17h. Pause déjeuner entre {} et {}. Temps de travail journalier : 7h. \n",
+                            day.weekday_name,
+                            day.date.day(),
+                            month_name,
+                            sched.lunch_start,
+                            sched.lunch_end,
+                        ));
+                    }
+                }
             }
         }
         out.push_str(&format!(
@@ -233,7 +270,7 @@ impl WeekReport {
         ));
         out.push_str(&format!(
             "TOTAL CONGES HEBDOMADAIRE : {}h \n",
-            self.holiday_hours
+            self.off_hours
         ));
         out
     }
@@ -324,7 +361,7 @@ mod tests {
     #[test]
     fn week_days_returns_5_days_mon_to_fri() {
         // 2026-04-16 is a Wednesday
-        let days = week_days(d(2026, 4, 16));
+        let days = week_days(d(2026, 4, 16), &[]);
         assert_eq!(days.len(), 5);
         assert_eq!(days[0].1, "Lundi");
         assert_eq!(days[4].1, "Vendredi");
@@ -335,25 +372,38 @@ mod tests {
     #[test]
     fn week_days_from_friday_same_week() {
         // Friday April 17 2026
-        let days = week_days(d(2026, 4, 17));
+        let days = week_days(d(2026, 4, 17), &[]);
         assert_eq!(days[0].0, d(2026, 4, 13)); // still Monday of same week
     }
 
     #[test]
     fn week_days_from_monday() {
-        let days = week_days(d(2026, 4, 13));
+        let days = week_days(d(2026, 4, 13), &[]);
         assert_eq!(days[0].0, d(2026, 4, 13));
     }
 
     #[test]
     fn week_days_detects_holiday() {
         // Week of May 1 2026 (Friday)
-        let days = week_days(d(2026, 5, 1));
+        let days = week_days(d(2026, 5, 1), &[]);
         // May 1 is Fête du Travail (Friday = index 4)
-        assert!(days[4].2.is_some());
-        assert_eq!(days[4].2.unwrap(), "Fête du Travail");
-        // Other days should not be holidays
-        assert!(days[0].2.is_none());
+        assert_eq!(days[4].2, DayKind::Holiday("Fête du Travail"));
+        assert_eq!(days[0].2, DayKind::Worked);
+    }
+
+    #[test]
+    fn week_days_detects_personal_off() {
+        // Week of Apr 13-17 2026 (no holidays). Mark Friday Apr 17 as personal off.
+        let days = week_days(d(2026, 4, 13), &[d(2026, 4, 17)]);
+        assert_eq!(days[4].2, DayKind::Off);
+        assert_eq!(days[0].2, DayKind::Worked);
+    }
+
+    #[test]
+    fn holiday_takes_precedence_over_personal_off() {
+        // May 1 2026 is a holiday; even if marked as off, holiday wins.
+        let days = week_days(d(2026, 5, 1), &[d(2026, 5, 1)]);
+        assert_eq!(days[4].2, DayKind::Holiday("Fête du Travail"));
     }
 
     // --- worked_day_count ---
@@ -361,40 +411,60 @@ mod tests {
     #[test]
     fn worked_day_count_normal_week() {
         // Week of April 13 2026 — no holidays
-        assert_eq!(worked_day_count(d(2026, 4, 16)), 5);
+        assert_eq!(worked_day_count(d(2026, 4, 16), &[]), 5);
     }
 
     #[test]
     fn worked_day_count_with_holiday() {
         // Week of May 1 2026 — Fête du Travail on Friday
-        assert_eq!(worked_day_count(d(2026, 5, 1)), 4);
+        assert_eq!(worked_day_count(d(2026, 5, 1), &[]), 4);
+    }
+
+    #[test]
+    fn worked_day_count_with_personal_off() {
+        // Week Apr 13-17 2026 has no holidays. Friday Apr 17 off → 4 worked.
+        assert_eq!(worked_day_count(d(2026, 4, 13), &[d(2026, 4, 17)]), 4);
+    }
+
+    #[test]
+    fn worked_day_count_with_holiday_and_personal_off() {
+        // Week of May 11-15 2026: Thu May 14 = Ascension, Fri May 15 = personal off
+        assert_eq!(worked_day_count(d(2026, 5, 12), &[d(2026, 5, 15)]), 3);
     }
 
     #[test]
     fn worked_day_count_ascension_week_2026() {
         // Ascension 2026 = May 14 (Thursday)
-        assert_eq!(worked_day_count(d(2026, 5, 14)), 4);
+        assert_eq!(worked_day_count(d(2026, 5, 14), &[]), 4);
     }
 
     // --- build_llm_prompt ---
 
     #[test]
     fn prompt_contains_day_count() {
-        let prompt = build_llm_prompt(d(2026, 4, 16));
+        let prompt = build_llm_prompt(d(2026, 4, 16), &[]);
         assert!(prompt.contains("5 jours"));
     }
 
     #[test]
     fn prompt_excludes_holiday_days() {
         // May 1 2026 is Friday (Fête du Travail)
-        let prompt = build_llm_prompt(d(2026, 5, 1));
+        let prompt = build_llm_prompt(d(2026, 5, 1), &[]);
         assert!(prompt.contains("4 jours"));
         assert!(!prompt.contains("Vendredi")); // holiday day excluded from worked list
     }
 
     #[test]
+    fn prompt_excludes_personal_off_days() {
+        // Week Apr 13-17 2026 (no holidays). Friday Apr 17 marked as personal off.
+        let prompt = build_llm_prompt(d(2026, 4, 13), &[d(2026, 4, 17)]);
+        assert!(prompt.contains("4 jours"));
+        assert!(!prompt.contains("Vendredi"));
+    }
+
+    #[test]
     fn prompt_contains_valid_pairs_example() {
-        let prompt = build_llm_prompt(d(2026, 4, 16));
+        let prompt = build_llm_prompt(d(2026, 4, 16), &[]);
         assert!(prompt.contains("12h00"));
         assert!(prompt.contains("13h30"));
     }
@@ -410,11 +480,11 @@ mod tests {
             ("13h30", "14h30"),
             ("14h00", "15h00"),
         ]);
-        let week = assemble(d(2026, 4, 16), &schedule);
+        let week = assemble(d(2026, 4, 16), &[], &schedule);
         assert_eq!(week.days.len(), 5);
         assert_eq!(week.total_hours, 35);
-        assert_eq!(week.holiday_hours, 0);
-        assert!(week.days.iter().all(|d| d.holiday.is_none()));
+        assert_eq!(week.off_hours, 0);
+        assert!(week.days.iter().all(|d| d.kind == DayKind::Worked));
         assert!(week.days.iter().all(|d| d.schedule.is_some()));
     }
 
@@ -427,12 +497,42 @@ mod tests {
             ("13h00", "14h00"),
             ("13h30", "14h30"),
         ]);
-        let week = assemble(d(2026, 5, 1), &schedule);
+        let week = assemble(d(2026, 5, 1), &[], &schedule);
         assert_eq!(week.total_hours, 28); // 4 * 7
-        assert_eq!(week.holiday_hours, 7);
-        // Friday (index 4) should be holiday
-        assert!(week.days[4].holiday.is_some());
+        assert_eq!(week.off_hours, 7);
+        assert!(matches!(week.days[4].kind, DayKind::Holiday(_)));
         assert!(week.days[4].schedule.is_none());
+    }
+
+    #[test]
+    fn assemble_with_personal_off() {
+        // Week Apr 13-17 2026 (no holidays). Friday Apr 17 personal off.
+        let schedule = make_schedule(&[
+            ("12h00", "13h00"),
+            ("12h30", "13h30"),
+            ("13h00", "14h00"),
+            ("13h30", "14h30"),
+        ]);
+        let week = assemble(d(2026, 4, 13), &[d(2026, 4, 17)], &schedule);
+        assert_eq!(week.total_hours, 28);
+        assert_eq!(week.off_hours, 7);
+        assert_eq!(week.days[4].kind, DayKind::Off);
+        assert!(week.days[4].schedule.is_none());
+    }
+
+    #[test]
+    fn assemble_with_holiday_and_personal_off() {
+        // Week of May 11-15 2026: Thu May 14 = Ascension, Fri May 15 = personal off
+        let schedule = make_schedule(&[
+            ("12h00", "13h00"),
+            ("12h30", "13h30"),
+            ("13h00", "14h00"),
+        ]);
+        let week = assemble(d(2026, 5, 12), &[d(2026, 5, 15)], &schedule);
+        assert_eq!(week.total_hours, 21); // 3 * 7
+        assert_eq!(week.off_hours, 14); // 2 * 7
+        assert!(matches!(week.days[3].kind, DayKind::Holiday(_)));
+        assert_eq!(week.days[4].kind, DayKind::Off);
     }
 
     // --- to_mail_body ---
@@ -446,7 +546,7 @@ mod tests {
             ("13h30", "14h30"),
             ("14h00", "15h00"),
         ]);
-        let week = assemble(d(2026, 4, 16), &schedule);
+        let week = assemble(d(2026, 4, 16), &[], &schedule);
         let body = week.to_mail_body();
 
         assert!(body.contains("Lundi 13 avril"));
@@ -465,13 +565,160 @@ mod tests {
             ("13h00", "14h00"),
             ("13h30", "14h30"),
         ]);
-        let week = assemble(d(2026, 5, 1), &schedule);
+        let week = assemble(d(2026, 5, 1), &[], &schedule);
         let body = week.to_mail_body();
 
         assert!(body.contains("Férié"));
         assert!(body.contains("Fête du Travail"));
         assert!(body.contains("TOTAL DURÉE DE TRAVAIL HEBDOMADAIRE : 28h"));
         assert!(body.contains("TOTAL CONGES HEBDOMADAIRE : 7h"));
+    }
+
+    #[test]
+    fn mail_body_format_with_personal_off() {
+        // Week Apr 13-17 2026 (no holidays). Friday Apr 17 personal off.
+        let schedule = make_schedule(&[
+            ("12h00", "13h00"),
+            ("12h30", "13h30"),
+            ("13h00", "14h00"),
+            ("13h30", "14h30"),
+        ]);
+        let week = assemble(d(2026, 4, 13), &[d(2026, 4, 17)], &schedule);
+        let body = week.to_mail_body();
+        assert!(body.contains("Vendredi 17 avril - Congé. Temps de travail journalier : 0h."));
+        assert!(body.contains("TOTAL DURÉE DE TRAVAIL HEBDOMADAIRE : 28h"));
+        assert!(body.contains("TOTAL CONGES HEBDOMADAIRE : 7h"));
+    }
+
+    /// Helper that mimics what off_days::load_expanded() returns from a single range entry.
+    fn expand(start: NaiveDate, end: NaiveDate) -> Vec<NaiveDate> {
+        let mut out = Vec::new();
+        let mut d = start;
+        while d <= end {
+            out.push(d);
+            d += chrono::Duration::days(1);
+        }
+        out
+    }
+
+    #[test]
+    fn range_covering_full_week_marks_all_days_off() {
+        // 4-week summer range Aug 3 → Aug 28 2026 (no public holiday in window).
+        // Pick a fully-covered week (Aug 10-14).
+        let off = expand(d(2026, 8, 3), d(2026, 8, 28));
+        let days = week_days(d(2026, 8, 12), &off);
+        assert!(days.iter().all(|(_, _, k)| *k == DayKind::Off));
+        assert_eq!(worked_day_count(d(2026, 8, 12), &off), 0);
+    }
+
+    #[test]
+    fn range_partial_at_start_of_range() {
+        // Range Aug 3 → Aug 28 2026; Aug 3 is a Monday → full week off.
+        let off = expand(d(2026, 8, 3), d(2026, 8, 28));
+        let days = week_days(d(2026, 8, 3), &off);
+        assert!(days.iter().all(|(_, _, k)| *k == DayKind::Off));
+    }
+
+    #[test]
+    fn range_partial_at_end_of_range() {
+        // Range Aug 3 → Aug 28 2026; Aug 28 is a Friday → final week fully off.
+        let off = expand(d(2026, 8, 3), d(2026, 8, 28));
+        let days = week_days(d(2026, 8, 24), &off);
+        assert!(days.iter().all(|(_, _, k)| *k == DayKind::Off));
+        // Following week (Aug 31 - Sep 4) should be fully worked.
+        let next = week_days(d(2026, 8, 31), &off);
+        assert!(next.iter().all(|(_, _, k)| *k == DayKind::Worked));
+    }
+
+    #[test]
+    fn range_partial_overlap_week_boundary() {
+        // Range Wed Aug 5 → Tue Aug 11 2026 — splits across two weeks, no holidays.
+        let off = expand(d(2026, 8, 5), d(2026, 8, 11));
+        // Week of Aug 3: Mon/Tue worked, Wed/Thu/Fri off
+        let w1 = week_days(d(2026, 8, 3), &off);
+        assert_eq!(w1[0].2, DayKind::Worked); // Mon 3
+        assert_eq!(w1[1].2, DayKind::Worked); // Tue 4
+        assert_eq!(w1[2].2, DayKind::Off); // Wed 5
+        assert_eq!(w1[3].2, DayKind::Off); // Thu 6
+        assert_eq!(w1[4].2, DayKind::Off); // Fri 7
+        // Week of Aug 10: Mon/Tue off, Wed/Thu/Fri worked
+        let w2 = week_days(d(2026, 8, 10), &off);
+        assert_eq!(w2[0].2, DayKind::Off); // Mon 10
+        assert_eq!(w2[1].2, DayKind::Off); // Tue 11
+        assert_eq!(w2[2].2, DayKind::Worked); // Wed 12
+        assert_eq!(w2[3].2, DayKind::Worked); // Thu 13
+        assert_eq!(w2[4].2, DayKind::Worked); // Fri 14
+    }
+
+    #[test]
+    fn range_spanning_public_holiday() {
+        // Range Mon Jul 13 → Fri Jul 17 2026 includes Tue 14 (Fête Nationale).
+        // The holiday must still display as "Férié", not "Congé".
+        let off = expand(d(2026, 7, 13), d(2026, 7, 17));
+        let days = week_days(d(2026, 7, 13), &off);
+        assert_eq!(days[0].2, DayKind::Off); // Mon 13
+        assert_eq!(days[1].2, DayKind::Holiday("Fête Nationale")); // Tue 14
+        assert_eq!(days[2].2, DayKind::Off); // Wed 15
+        assert_eq!(days[3].2, DayKind::Off); // Thu 16
+        assert_eq!(days[4].2, DayKind::Off); // Fri 17
+        // Total off hours = 5 * 7 = 35h (4 personal off + 1 holiday)
+        let week = assemble(
+            d(2026, 7, 13),
+            &off,
+            &LlmWeekOutput { days: vec![] },
+        );
+        assert_eq!(week.total_hours, 0);
+        assert_eq!(week.off_hours, 35);
+        let body = week.to_mail_body();
+        assert!(body.contains("Mardi 14 juillet - Férié (Fête Nationale)"));
+        assert_eq!(body.matches("Congé").count(), 4);
+    }
+
+    #[test]
+    fn fully_off_week_produces_zero_worked_hours() {
+        // Range fully covers week of Aug 10-14 2026. LLM gets 0 worked days → empty schedule.
+        let off = expand(d(2026, 8, 3), d(2026, 8, 28));
+        let schedule = LlmWeekOutput { days: vec![] };
+        let week = assemble(d(2026, 8, 12), &off, &schedule);
+        assert_eq!(week.total_hours, 0);
+        assert_eq!(week.off_hours, 35);
+        let body = week.to_mail_body();
+        assert!(body.contains("TOTAL DURÉE DE TRAVAIL HEBDOMADAIRE : 0h"));
+        assert!(body.contains("TOTAL CONGES HEBDOMADAIRE : 35h"));
+        // Every day must be a Congé line, no schedule
+        assert_eq!(body.matches("Congé").count(), 5);
+    }
+
+    #[test]
+    fn prompt_for_fully_off_week_requests_zero_days() {
+        let off = expand(d(2026, 8, 3), d(2026, 8, 28));
+        let prompt = build_llm_prompt(d(2026, 8, 12), &off);
+        assert!(prompt.contains("0 jours"));
+    }
+
+    #[test]
+    fn off_day_in_future_week_does_not_affect_current_week() {
+        // We're computing for week of Apr 13 2026, but off day is Jul 17 2026 — unrelated.
+        let off = vec![d(2026, 7, 17)];
+        let days = week_days(d(2026, 4, 13), &off);
+        assert!(days.iter().all(|(_, _, k)| *k == DayKind::Worked));
+        assert_eq!(worked_day_count(d(2026, 4, 13), &off), 5);
+    }
+
+    #[test]
+    fn mail_body_format_with_holiday_and_personal_off() {
+        // Week of May 11 2026: Thu = Ascension (férié), Fri = perso off
+        let schedule = make_schedule(&[
+            ("12h00", "13h00"),
+            ("12h30", "13h30"),
+            ("13h00", "14h00"),
+        ]);
+        let week = assemble(d(2026, 5, 12), &[d(2026, 5, 15)], &schedule);
+        let body = week.to_mail_body();
+        assert!(body.contains("Jeudi 14 mai - Férié (Ascension)"));
+        assert!(body.contains("Vendredi 15 mai - Congé"));
+        assert!(body.contains("TOTAL DURÉE DE TRAVAIL HEBDOMADAIRE : 21h"));
+        assert!(body.contains("TOTAL CONGES HEBDOMADAIRE : 14h"));
     }
 
     #[test]
@@ -483,7 +730,7 @@ mod tests {
             ("13h30", "14h30"),
             ("14h00", "15h00"),
         ]);
-        let week = assemble(d(2026, 4, 16), &schedule);
+        let week = assemble(d(2026, 4, 16), &[], &schedule);
         let body = week.to_mail_body();
 
         // Must NOT contain greetings or signature
@@ -504,7 +751,7 @@ mod tests {
             ("13h00", "14h00"),
             ("13h30", "14h30"),
         ]);
-        let week = assemble(d(2027, 1, 1), &schedule);
+        let week = assemble(d(2027, 1, 1), &[], &schedule);
         let body = week.to_mail_body();
         assert!(body.contains("Lundi 28 décembre"));
         assert!(body.contains("Mardi 29 décembre"));
@@ -523,7 +770,7 @@ mod tests {
             ("13h00", "14h00"),
             ("13h30", "14h30"),
         ]);
-        let week = assemble(d(2026, 5, 1), &schedule);
+        let week = assemble(d(2026, 5, 1), &[], &schedule);
         let body = week.to_mail_body();
         assert!(body.contains("Jeudi 30 avril"));
         assert!(body.contains("Vendredi 1 mai"));

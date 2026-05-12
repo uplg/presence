@@ -2,12 +2,13 @@ mod config;
 mod email;
 mod holidays;
 mod llm;
+mod off_days;
 mod report;
 mod telegram;
 
-use anyhow::Result;
-use chrono::Local;
-use rand::Rng;
+use anyhow::{Context, Result, bail};
+use chrono::{Local, NaiveDate};
+use rand::RngExt;
 use std::sync::Arc;
 use tokio_cron_scheduler::{Job, JobScheduler};
 use tracing::{error, info};
@@ -15,14 +16,18 @@ use tracing::{error, info};
 /// Run the full pipeline: LLM → assemble report → format → send email → notify Telegram.
 async fn run_pipeline(cfg: &config::Config, llm: &llm::Llm) -> Result<()> {
     let today = Local::now().date_naive();
+    let personal_off = off_days::load_expanded().unwrap_or_else(|e| {
+        error!("failed to load off_days.json, treating week as fully worked: {e:#}");
+        Vec::new()
+    });
 
     info!("generating schedule for week of {today}...");
-    let prompt = report::build_llm_prompt(today);
-    let worked_count = report::worked_day_count(today);
+    let prompt = report::build_llm_prompt(today, &personal_off);
+    let worked_count = report::worked_day_count(today, &personal_off);
 
     let schedule = llm.generate_schedule(&prompt, worked_count).await?;
 
-    let week = report::assemble(today, &schedule);
+    let week = report::assemble(today, &personal_off, &schedule);
     let mail_body = week.to_mail_body();
     info!("mail body:\n{mail_body}");
 
@@ -34,7 +39,7 @@ async fn run_pipeline(cfg: &config::Config, llm: &llm::Llm) -> Result<()> {
         &cfg.sender_name,
         &cfg.gmail_app_password,
         &[cfg.recipient_1.as_str(), cfg.recipient_2.as_str()],
-        &subject,
+        subject,
         &mail_body,
     )
     .await?;
@@ -50,6 +55,80 @@ async fn run_pipeline(cfg: &config::Config, llm: &llm::Llm) -> Result<()> {
     Ok(())
 }
 
+fn parse_date(s: &str) -> Result<NaiveDate> {
+    NaiveDate::parse_from_str(s, "%Y-%m-%d")
+        .with_context(|| format!("invalid date '{s}', expected YYYY-MM-DD"))
+}
+
+fn print_usage_off() {
+    eprintln!("usage:");
+    eprintln!("  presence off add YYYY-MM-DD [YYYY-MM-DD]   add a single day or inclusive range");
+    eprintln!("  presence off remove YYYY-MM-DD             remove the entry starting on that date");
+    eprintln!("  presence off list                          list configured off days");
+}
+
+fn handle_off(args: &[String]) -> Result<()> {
+    let Some(sub) = args.first() else {
+        print_usage_off();
+        bail!("missing subcommand");
+    };
+
+    match sub.as_str() {
+        "add" => {
+            let start = args
+                .get(1)
+                .with_context(|| "missing start date")
+                .and_then(|s| parse_date(s))?;
+            let end = match args.get(2) {
+                Some(s) => parse_date(s)?,
+                None => start,
+            };
+            let entry = off_days::OffEntry::range(start, end)?;
+            let added = off_days::add(entry.clone())?;
+            if added {
+                if entry.start == entry.end {
+                    println!("added: {}", entry.start);
+                } else {
+                    println!("added: {} → {}", entry.start, entry.end);
+                }
+            } else {
+                println!("already present, no change");
+            }
+        }
+        "remove" | "rm" => {
+            let date = args
+                .get(1)
+                .with_context(|| "missing date")
+                .and_then(|s| parse_date(s))?;
+            let removed = off_days::remove_by_start(date)?;
+            if removed {
+                println!("removed entry starting {date}");
+            } else {
+                println!("no entry starts on {date}");
+            }
+        }
+        "list" | "ls" => {
+            let entries = off_days::load()?;
+            if entries.is_empty() {
+                println!("no off days configured");
+            } else {
+                for e in entries {
+                    if e.start == e.end {
+                        println!("{}", e.start);
+                    } else {
+                        println!("{} → {}", e.start, e.end);
+                    }
+                }
+            }
+        }
+        other => {
+            print_usage_off();
+            bail!("unknown subcommand: {other}");
+        }
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -59,25 +138,36 @@ async fn main() -> Result<()> {
         )
         .init();
 
+    let args: Vec<String> = std::env::args().collect();
+
+    // Subcommand: off
+    if args.get(1).map(String::as_str) == Some("off") {
+        return handle_off(&args[2..]);
+    }
+
     let cfg = config::Config::from_env()?;
     info!("config loaded");
 
     // --now: run immediately and exit
-    if std::env::args().any(|a| a == "--now") {
+    if args.iter().any(|a| a == "--now") {
         info!("--now: running immediately");
         let llm = llm::Llm::load().await?;
         return run_pipeline(&cfg, &llm).await;
     }
 
     // --dry-run: generate and print, don't send
-    if std::env::args().any(|a| a == "--dry-run") {
+    if args.iter().any(|a| a == "--dry-run") {
         info!("--dry-run: generating report only");
         let llm = llm::Llm::load().await?;
         let today = Local::now().date_naive();
-        let prompt = report::build_llm_prompt(today);
-        let worked_count = report::worked_day_count(today);
+        let personal_off = off_days::load_expanded().unwrap_or_else(|e| {
+            error!("failed to load off_days.json: {e:#}");
+            Vec::new()
+        });
+        let prompt = report::build_llm_prompt(today, &personal_off);
+        let worked_count = report::worked_day_count(today, &personal_off);
         let schedule = llm.generate_schedule(&prompt, worked_count).await?;
-        let week = report::assemble(today, &schedule);
+        let week = report::assemble(today, &personal_off, &schedule);
         println!("{}", week.to_mail_body());
         return Ok(());
     }
