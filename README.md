@@ -55,7 +55,17 @@ The first run downloads `Qwen/Qwen3-0.6B` (~1.2 GB) from Hugging Face.
 
 # Dry run — generate and print the report without sending anything
 ./target/release/presence --dry-run
+
+# Re-run a missed/failed past week — any day in that week works.
+# Combines with --now (send) or --dry-run (print).
+./target/release/presence --now --for 2026-05-15
+./target/release/presence --dry-run --for 2026-05-15
 ```
+
+If the scheduled Friday run fails for any reason (e.g. the local LLM can't
+load because another process is using the memory), the daemon sends a Telegram
+alert with the error and the exact `--now --for <date>` command to recover the
+missed week.
 
 ## Personal off days (congés)
 

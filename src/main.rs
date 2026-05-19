@@ -13,21 +13,21 @@ use std::sync::Arc;
 use tokio_cron_scheduler::{Job, JobScheduler};
 use tracing::{error, info};
 
-/// Run the full pipeline: LLM → assemble report → format → send email → notify Telegram.
-async fn run_pipeline(cfg: &config::Config, llm: &llm::Llm) -> Result<()> {
-    let today = Local::now().date_naive();
+/// Run the full pipeline for the week containing `target`:
+/// LLM → assemble report → format → send email → notify Telegram.
+async fn run_pipeline(cfg: &config::Config, llm: &llm::Llm, target: NaiveDate) -> Result<()> {
     let personal_off = off_days::load_expanded().unwrap_or_else(|e| {
         error!("failed to load off_days.json, treating week as fully worked: {e:#}");
         Vec::new()
     });
 
-    info!("generating schedule for week of {today}...");
-    let prompt = report::build_llm_prompt(today, &personal_off);
-    let worked_count = report::worked_day_count(today, &personal_off);
+    info!("generating schedule for week of {target}...");
+    let prompt = report::build_llm_prompt(target, &personal_off);
+    let worked_count = report::worked_day_count(target, &personal_off);
 
     let schedule = llm.generate_schedule(&prompt, worked_count).await?;
 
-    let week = report::assemble(today, &personal_off, &schedule);
+    let week = report::assemble(target, &personal_off, &schedule);
     let mail_body = week.to_mail_body();
     info!("mail body:\n{mail_body}");
 
@@ -58,6 +58,47 @@ async fn run_pipeline(cfg: &config::Config, llm: &llm::Llm) -> Result<()> {
 fn parse_date(s: &str) -> Result<NaiveDate> {
     NaiveDate::parse_from_str(s, "%Y-%m-%d")
         .with_context(|| format!("invalid date '{s}', expected YYYY-MM-DD"))
+}
+
+/// Extract an optional `--for YYYY-MM-DD` (alias `--week`) target date from args.
+/// Any day within the desired week works — the report week is derived from it.
+/// Used to re-run a missed/failed past week.
+fn parse_target_date(args: &[String]) -> Result<Option<NaiveDate>> {
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a == "--for" || a == "--week" {
+            let val = it
+                .next()
+                .with_context(|| format!("{a} requires a date argument (YYYY-MM-DD)"))?;
+            return Ok(Some(parse_date(val)?));
+        }
+    }
+    Ok(None)
+}
+
+/// Load the LLM and run the full pipeline for the week containing `target`.
+async fn run_once(cfg: &config::Config, target: NaiveDate) -> Result<()> {
+    let llm = llm::Llm::load().await.context("LLM load failed")?;
+    run_pipeline(cfg, &llm, target).await
+}
+
+/// Run for `target`'s week; on ANY failure (LLM load, email, Telegram, …)
+/// log it and push a Telegram alert containing the exact recovery command.
+async fn run_and_alert(cfg: &config::Config, target: NaiveDate) {
+    if let Err(e) = run_once(cfg, target).await {
+        error!("run failed for week of {target}: {e:#}");
+        let msg = format!(
+            "⚠️ Presence : échec de l'envoi de la feuille de présence (semaine du {target}).\n\n\
+             Erreur : {e:#}\n\n\
+             Pour relancer manuellement cette semaine :\n\
+             presence --now --for {target}"
+        );
+        if let Err(te) =
+            telegram::notify_error(&cfg.telegram_bot_token, &cfg.telegram_chat_id, &msg).await
+        {
+            error!("failed to send Telegram error alert: {te:#}");
+        }
+    }
 }
 
 fn print_usage_off() {
@@ -148,26 +189,29 @@ async fn main() -> Result<()> {
     let cfg = config::Config::from_env()?;
     info!("config loaded");
 
-    // --now: run immediately and exit
+    // Optional `--for YYYY-MM-DD` overrides the target week (defaults to today's
+    // week). Lets you re-run a missed/failed past week.
+    let target = parse_target_date(&args)?.unwrap_or_else(|| Local::now().date_naive());
+
+    // --now: run immediately and exit. Still alerts on Telegram if it fails.
     if args.iter().any(|a| a == "--now") {
-        info!("--now: running immediately");
-        let llm = llm::Llm::load().await?;
-        return run_pipeline(&cfg, &llm).await;
+        info!("--now: running immediately for week of {target}");
+        run_and_alert(&cfg, target).await;
+        return Ok(());
     }
 
     // --dry-run: generate and print, don't send
     if args.iter().any(|a| a == "--dry-run") {
-        info!("--dry-run: generating report only");
+        info!("--dry-run: generating report only for week of {target}");
         let llm = llm::Llm::load().await?;
-        let today = Local::now().date_naive();
         let personal_off = off_days::load_expanded().unwrap_or_else(|e| {
             error!("failed to load off_days.json: {e:#}");
             Vec::new()
         });
-        let prompt = report::build_llm_prompt(today, &personal_off);
-        let worked_count = report::worked_day_count(today, &personal_off);
+        let prompt = report::build_llm_prompt(target, &personal_off);
+        let worked_count = report::worked_day_count(target, &personal_off);
         let schedule = llm.generate_schedule(&prompt, worked_count).await?;
-        let week = report::assemble(today, &personal_off, &schedule);
+        let week = report::assemble(target, &personal_off, &schedule);
         println!("{}", week.to_mail_body());
         return Ok(());
     }
@@ -186,17 +230,7 @@ async fn main() -> Result<()> {
                 info!("Friday trigger, delaying {delay}s...");
                 tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
 
-                let llm = match llm::Llm::load().await {
-                    Ok(l) => l,
-                    Err(e) => {
-                        error!("LLM load failed: {e:#}");
-                        return;
-                    }
-                };
-
-                if let Err(e) = run_pipeline(&cfg, &llm).await {
-                    error!("pipeline failed: {e:#}");
-                }
+                run_and_alert(&cfg, Local::now().date_naive()).await;
             })
         })?;
     sched.add(job).await?;

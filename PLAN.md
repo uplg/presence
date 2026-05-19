@@ -113,14 +113,22 @@ Fixed dates + Easter-based (Pâques, Ascension, Pentecôte) calculated algorithm
 - Runs every Friday
 - Cron triggers at 17:10, then random 0-20min delay (so actual send is 17:10-17:30)
 - Flow: load LLM → generate lunch times → assemble report → format mail → send SMTP → notify Telegram
+- On ANY failure in that flow (incl. LLM load OOM): log + Telegram alert (plain
+  text, no Markdown so error strings with `[`/`_` don't break it) containing
+  the error and the `presence --now --for <date>` recovery command
 
 ## CLI
 
 ```bash
-presence              # Daemon mode (cron scheduler)
-presence --now        # Run immediately, send email, exit
-presence --dry-run    # Generate and print report, don't send
+presence                        # Daemon mode (cron scheduler)
+presence --now                  # Run immediately, send email, exit
+presence --dry-run              # Generate and print report, don't send
+presence --now --for 2026-05-15 # Re-run a missed/failed past week (send)
+presence --dry-run --for ...    # Re-run a past week (print only)
 ```
+
+`--for YYYY-MM-DD` (alias `--week`) overrides the target week; any day inside
+the desired week works since the Mon–Fri span is derived from it.
 
 ## launchd (macOS auto-start)
 
