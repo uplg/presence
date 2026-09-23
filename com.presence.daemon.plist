@@ -7,7 +7,7 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/leonard/Github/presence/target/release/presence</string>
+        <string>/Users/leonard/.cargo/bin/presence</string>
     </array>
 
     <key>WorkingDirectory</key>

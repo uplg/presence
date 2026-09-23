@@ -1,14 +1,21 @@
 use chrono::{Datelike, Duration, NaiveDate, Weekday};
-use serde::{Deserialize, Serialize};
+use rand::Rng;
+use rand::seq::IndexedRandom;
 
 use crate::holidays;
 
-/// What the LLM returns per worked day — just the variable parts.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DaySchedule {
-    pub lunch_start: String, // e.g. "12h30"
-    pub lunch_end: String,   // e.g. "13h30"
-}
+/// A lunch break as (start, end), formatted the way it appears in the mail.
+pub type LunchSlot = (&'static str, &'static str);
+
+/// Allowed lunch breaks (always 1h) with their relative weights: early-ish
+/// lunches are the most common, 14h00 stays rare.
+const LUNCH_SLOTS: [(LunchSlot, u32); 5] = [
+    (("12h00", "13h00"), 3),
+    (("12h30", "13h30"), 4),
+    (("13h00", "14h00"), 3),
+    (("13h30", "14h30"), 2),
+    (("14h00", "15h00"), 1),
+];
 
 /// How a single day is categorised in the weekly report.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,7 +31,7 @@ pub struct DayReport {
     pub date: NaiveDate,
     pub weekday_name: &'static str,
     pub kind: DayKind,
-    pub schedule: Option<DaySchedule>, // Some only when kind == Worked
+    pub lunch: Option<LunchSlot>, // Some only when kind == Worked
 }
 
 #[derive(Debug, Clone)]
@@ -34,58 +41,32 @@ pub struct WeekReport {
     pub off_hours: u32, // holidays + personal off days
 }
 
-/// The JSON structure we ask the LLM to produce.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LlmWeekOutput {
-    pub days: Vec<DaySchedule>,
+/// Draw `count` lunch breaks that look naturally varied:
+/// - weighted towards usual lunch times,
+/// - never the same slot 3 days in a row,
+/// - never the same slot for the whole week (when there are 2+ days).
+pub fn lunch_schedule<R: Rng + ?Sized>(count: usize, rng: &mut R) -> Vec<LunchSlot> {
+    let mut out: Vec<LunchSlot> = Vec::with_capacity(count);
+    for i in 0..count {
+        let three_in_a_row = i >= 2 && out[i - 1] == out[i - 2];
+        let uniform_week = i >= 1 && i == count - 1 && out.iter().all(|s| *s == out[0]);
+        let banned = (three_in_a_row || uniform_week).then(|| out[i - 1]);
+
+        let candidates: Vec<_> = LUNCH_SLOTS
+            .iter()
+            .filter(|(slot, _)| Some(*slot) != banned)
+            .collect();
+        let (slot, _) = candidates
+            .choose_weighted(rng, |(_, w)| *w)
+            .expect("lunch slot weights are positive");
+        out.push(*slot);
+    }
+    out
 }
 
-const VALID_PAIRS: [(&str, &str); 5] = [
-    ("12h00", "13h00"),
-    ("12h30", "13h30"),
-    ("13h00", "14h00"),
-    ("13h30", "14h30"),
-    ("14h00", "15h00"),
-];
-
-impl LlmWeekOutput {
-    /// Fix lunch_end to match lunch_start (the JSON schema can't enforce pairing).
-    pub fn fix_pairs(&mut self) {
-        for day in &mut self.days {
-            day.lunch_end = match day.lunch_start.as_str() {
-                "12h00" => "13h00",
-                "12h30" => "13h30",
-                "13h00" => "14h00",
-                "13h30" => "14h30",
-                "14h00" => "15h00",
-                _ => "13h30", // shouldn't happen with schema constraint
-            }
-            .to_string();
-        }
-    }
-
-    /// Validate that every entry uses a valid lunch pair and the count matches.
-    pub fn validate(&self, expected_days: usize) -> Result<(), String> {
-        if self.days.len() != expected_days {
-            return Err(format!(
-                "expected {} days, got {}",
-                expected_days,
-                self.days.len()
-            ));
-        }
-        for (i, day) in self.days.iter().enumerate() {
-            let pair = (day.lunch_start.as_str(), day.lunch_end.as_str());
-            if !VALID_PAIRS.contains(&pair) {
-                return Err(format!(
-                    "day {}: invalid lunch pair ({}, {})",
-                    i + 1,
-                    day.lunch_start,
-                    day.lunch_end
-                ));
-            }
-        }
-        Ok(())
-    }
+/// Monday of the week containing `date`.
+pub fn week_monday(date: NaiveDate) -> NaiveDate {
+    date - Duration::days(date.weekday().num_days_from_monday() as i64)
 }
 
 fn weekday_name(w: Weekday) -> &'static str {
@@ -125,8 +106,7 @@ pub fn week_days(
     date: NaiveDate,
     personal_off: &[NaiveDate],
 ) -> Vec<(NaiveDate, &'static str, DayKind)> {
-    let weekday_num = date.weekday().num_days_from_monday();
-    let monday = date - Duration::days(weekday_num as i64);
+    let monday = week_monday(date);
 
     (0..5)
         .map(|i| {
@@ -151,69 +131,37 @@ pub fn worked_day_count(date: NaiveDate, personal_off: &[NaiveDate]) -> usize {
         .count()
 }
 
-/// Build the prompt that asks the LLM to produce JSON with variable lunch breaks.
-pub fn build_llm_prompt(date: NaiveDate, personal_off: &[NaiveDate]) -> String {
-    let days = week_days(date, personal_off);
-    let worked: Vec<&str> = days
-        .iter()
-        .filter(|(_, _, k)| matches!(k, DayKind::Worked))
-        .map(|(_, name, _)| *name)
-        .collect();
-
-    format!(
-        r#"Génère un JSON avec des horaires de pause déjeuner pour {count} jours travaillés ({worked_list}).
-
-RÈGLES STRICTES :
-- Chaque "lunch_start" DOIT être une de ces 5 valeurs EXACTES : "12h00", "12h30", "13h00", "13h30", "14h00"
-- "lunch_end" = lunch_start + 1h. Donc les seules paires valides sont :
-  "12h00"→"13h00", "12h30"→"13h30", "13h00"→"14h00", "13h30"→"14h30", "14h00"→"15h00"
-- AUCUNE AUTRE VALEUR N'EST ACCEPTÉE
-- Varie les paires entre les jours, pas la même tous les jours
-- Exactement {count} entrées dans "days"
-- UNIQUEMENT du JSON, rien d'autre
-
-Exemple pour 2 jours :
-{{"days":[{{"lunch_start":"12h30","lunch_end":"13h30"}},{{"lunch_start":"13h00","lunch_end":"14h00"}}]}}"#,
-        worked_list = worked.join(", "),
-        count = worked.len(),
-    )
-}
-
-/// Assemble a WeekReport from the week dates + LLM-generated schedules.
-pub fn assemble(
+/// Build the report for the week containing `date`, drawing fresh lunch breaks.
+pub fn generate<R: Rng + ?Sized>(
     date: NaiveDate,
     personal_off: &[NaiveDate],
-    llm_output: &LlmWeekOutput,
+    rng: &mut R,
 ) -> WeekReport {
-    let days_info = week_days(date, personal_off);
-    let mut schedule_iter = llm_output.days.iter();
+    let lunches = lunch_schedule(worked_day_count(date, personal_off), rng);
+    assemble(date, personal_off, &lunches)
+}
+
+/// Assemble a WeekReport from the week dates + one lunch slot per worked day.
+pub fn assemble(date: NaiveDate, personal_off: &[NaiveDate], lunches: &[LunchSlot]) -> WeekReport {
+    let mut lunches = lunches.iter().copied();
     let mut total_hours = 0u32;
     let mut off_hours = 0u32;
 
-    let days: Vec<DayReport> = days_info
+    let days: Vec<DayReport> = week_days(date, personal_off)
         .into_iter()
-        .map(|(d, name, kind)| match kind {
-            DayKind::Worked => {
+        .map(|(date, weekday_name, kind)| {
+            let lunch = if kind == DayKind::Worked {
                 total_hours += 7;
-                let sched = schedule_iter.next().cloned().unwrap_or(DaySchedule {
-                    lunch_start: "12h30".into(),
-                    lunch_end: "13h30".into(),
-                });
-                DayReport {
-                    date: d,
-                    weekday_name: name,
-                    kind: DayKind::Worked,
-                    schedule: Some(sched),
-                }
-            }
-            other => {
+                Some(lunches.next().expect("one lunch slot per worked day"))
+            } else {
                 off_hours += 7;
-                DayReport {
-                    date: d,
-                    weekday_name: name,
-                    kind: other,
-                    schedule: None,
-                }
+                None
+            };
+            DayReport {
+                date,
+                weekday_name,
+                kind,
+                lunch,
             }
         })
         .collect();
@@ -251,14 +199,14 @@ impl WeekReport {
                     ));
                 }
                 DayKind::Worked => {
-                    if let Some(sched) = &day.schedule {
+                    if let Some((start, end)) = day.lunch {
                         out.push_str(&format!(
                             "{} {} {} - Durée de ma journée de travail : 9h à 17h. Pause déjeuner entre {} et {}. Temps de travail journalier : 7h. \n",
                             day.weekday_name,
                             day.date.day(),
                             month_name,
-                            sched.lunch_start,
-                            sched.lunch_end,
+                            start,
+                            end,
                         ));
                     }
                 }
@@ -284,76 +232,79 @@ mod tests {
         NaiveDate::from_ymd_opt(y, m, day).unwrap()
     }
 
-    fn make_schedule(pairs: &[(&str, &str)]) -> LlmWeekOutput {
-        LlmWeekOutput {
-            days: pairs
-                .iter()
-                .map(|(s, e)| DaySchedule {
-                    lunch_start: s.to_string(),
-                    lunch_end: e.to_string(),
-                })
-                .collect(),
-        }
+    fn make_schedule(pairs: &[LunchSlot]) -> Vec<LunchSlot> {
+        pairs.to_vec()
     }
 
-    // --- fix_pairs ---
-
-    #[test]
-    fn fix_pairs_corrects_mismatched_end() {
-        let mut output = make_schedule(&[
-            ("12h00", "14h00"), // wrong end
-            ("13h30", "13h30"), // wrong end
-            ("14h00", "12h00"), // wrong end
-        ]);
-        output.fix_pairs();
-        assert_eq!(output.days[0].lunch_end, "13h00");
-        assert_eq!(output.days[1].lunch_end, "14h30");
-        assert_eq!(output.days[2].lunch_end, "15h00");
+    fn rng(seed: u64) -> rand::rngs::StdRng {
+        rand::SeedableRng::seed_from_u64(seed)
     }
 
+    // --- lunch_schedule ---
+
     #[test]
-    fn fix_pairs_preserves_correct_pairs() {
-        let mut output = make_schedule(&[
-            ("12h00", "13h00"),
-            ("12h30", "13h30"),
-            ("13h00", "14h00"),
-            ("13h30", "14h30"),
-            ("14h00", "15h00"),
-        ]);
-        output.fix_pairs();
-        for (day, (_, expected_end)) in output.days.iter().zip(VALID_PAIRS.iter()) {
-            assert_eq!(day.lunch_end, *expected_end);
+    fn lunch_schedule_returns_requested_count_of_valid_slots() {
+        for n in 0..=5 {
+            let lunches = lunch_schedule(n, &mut rng(n as u64));
+            assert_eq!(lunches.len(), n);
+            for slot in &lunches {
+                assert!(
+                    LUNCH_SLOTS.iter().any(|(s, _)| s == slot),
+                    "unknown slot {slot:?}"
+                );
+            }
         }
     }
 
     #[test]
-    fn fix_pairs_handles_unknown_start() {
-        let mut output = make_schedule(&[("11h00", "12h00")]);
-        output.fix_pairs();
-        // Unknown start falls back to "13h30"
-        assert_eq!(output.days[0].lunch_end, "13h30");
-    }
-
-    // --- validate ---
-
-    #[test]
-    fn validate_ok_with_valid_pairs() {
-        let output = make_schedule(&[("12h00", "13h00"), ("13h30", "14h30"), ("14h00", "15h00")]);
-        assert!(output.validate(3).is_ok());
+    fn lunch_breaks_always_last_one_hour() {
+        for ((start, end), _) in LUNCH_SLOTS {
+            let h = |s: &str| s[..2].parse::<u32>().unwrap() * 60 + s[3..].parse::<u32>().unwrap();
+            assert_eq!(h(end) - h(start), 60, "{start} → {end}");
+        }
     }
 
     #[test]
-    fn validate_fails_wrong_count() {
-        let output = make_schedule(&[("12h00", "13h00")]);
-        let err = output.validate(3).unwrap_err();
-        assert!(err.contains("expected 3 days, got 1"));
+    fn lunch_schedule_never_three_in_a_row() {
+        for seed in 0..2000 {
+            let lunches = lunch_schedule(5, &mut rng(seed));
+            for w in lunches.windows(3) {
+                assert!(!(w[0] == w[1] && w[1] == w[2]), "seed {seed}: {lunches:?}");
+            }
+        }
     }
 
     #[test]
-    fn validate_fails_invalid_pair() {
-        let output = make_schedule(&[("12h00", "14h00")]); // bad pairing
-        let err = output.validate(1).unwrap_err();
-        assert!(err.contains("invalid lunch pair"));
+    fn lunch_schedule_never_uniform_week() {
+        for n in 2..=5 {
+            for seed in 0..2000 {
+                let lunches = lunch_schedule(n, &mut rng(seed));
+                assert!(
+                    lunches.iter().any(|s| *s != lunches[0]),
+                    "seed {seed}: {lunches:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn lunch_schedule_uses_every_slot_over_time() {
+        let mut seen = std::collections::HashSet::new();
+        for seed in 0..200 {
+            seen.extend(lunch_schedule(5, &mut rng(seed)));
+        }
+        assert_eq!(seen.len(), LUNCH_SLOTS.len());
+    }
+
+    #[test]
+    fn generate_fills_every_worked_day() {
+        // Week of May 11 2026: Thu = Ascension, Fri = personal off → 3 worked days.
+        let week = generate(d(2026, 5, 12), &[d(2026, 5, 15)], &mut rng(42));
+        assert_eq!(week.total_hours, 21);
+        assert_eq!(week.off_hours, 14);
+        for day in &week.days {
+            assert_eq!(day.lunch.is_some(), day.kind == DayKind::Worked);
+        }
     }
 
     // --- week_days ---
@@ -438,37 +389,6 @@ mod tests {
         assert_eq!(worked_day_count(d(2026, 5, 14), &[]), 4);
     }
 
-    // --- build_llm_prompt ---
-
-    #[test]
-    fn prompt_contains_day_count() {
-        let prompt = build_llm_prompt(d(2026, 4, 16), &[]);
-        assert!(prompt.contains("5 jours"));
-    }
-
-    #[test]
-    fn prompt_excludes_holiday_days() {
-        // May 1 2026 is Friday (Fête du Travail)
-        let prompt = build_llm_prompt(d(2026, 5, 1), &[]);
-        assert!(prompt.contains("4 jours"));
-        assert!(!prompt.contains("Vendredi")); // holiday day excluded from worked list
-    }
-
-    #[test]
-    fn prompt_excludes_personal_off_days() {
-        // Week Apr 13-17 2026 (no holidays). Friday Apr 17 marked as personal off.
-        let prompt = build_llm_prompt(d(2026, 4, 13), &[d(2026, 4, 17)]);
-        assert!(prompt.contains("4 jours"));
-        assert!(!prompt.contains("Vendredi"));
-    }
-
-    #[test]
-    fn prompt_contains_valid_pairs_example() {
-        let prompt = build_llm_prompt(d(2026, 4, 16), &[]);
-        assert!(prompt.contains("12h00"));
-        assert!(prompt.contains("13h30"));
-    }
-
     // --- assemble ---
 
     #[test]
@@ -485,7 +405,7 @@ mod tests {
         assert_eq!(week.total_hours, 35);
         assert_eq!(week.off_hours, 0);
         assert!(week.days.iter().all(|d| d.kind == DayKind::Worked));
-        assert!(week.days.iter().all(|d| d.schedule.is_some()));
+        assert!(week.days.iter().all(|d| d.lunch.is_some()));
     }
 
     #[test]
@@ -501,7 +421,7 @@ mod tests {
         assert_eq!(week.total_hours, 28); // 4 * 7
         assert_eq!(week.off_hours, 7);
         assert!(matches!(week.days[4].kind, DayKind::Holiday(_)));
-        assert!(week.days[4].schedule.is_none());
+        assert!(week.days[4].lunch.is_none());
     }
 
     #[test]
@@ -517,17 +437,13 @@ mod tests {
         assert_eq!(week.total_hours, 28);
         assert_eq!(week.off_hours, 7);
         assert_eq!(week.days[4].kind, DayKind::Off);
-        assert!(week.days[4].schedule.is_none());
+        assert!(week.days[4].lunch.is_none());
     }
 
     #[test]
     fn assemble_with_holiday_and_personal_off() {
         // Week of May 11-15 2026: Thu May 14 = Ascension, Fri May 15 = personal off
-        let schedule = make_schedule(&[
-            ("12h00", "13h00"),
-            ("12h30", "13h30"),
-            ("13h00", "14h00"),
-        ]);
+        let schedule = make_schedule(&[("12h00", "13h00"), ("12h30", "13h30"), ("13h00", "14h00")]);
         let week = assemble(d(2026, 5, 12), &[d(2026, 5, 15)], &schedule);
         assert_eq!(week.total_hours, 21); // 3 * 7
         assert_eq!(week.off_hours, 14); // 2 * 7
@@ -662,11 +578,7 @@ mod tests {
         assert_eq!(days[3].2, DayKind::Off); // Thu 16
         assert_eq!(days[4].2, DayKind::Off); // Fri 17
         // Total off hours = 5 * 7 = 35h (4 personal off + 1 holiday)
-        let week = assemble(
-            d(2026, 7, 13),
-            &off,
-            &LlmWeekOutput { days: vec![] },
-        );
+        let week = assemble(d(2026, 7, 13), &off, &[]);
         assert_eq!(week.total_hours, 0);
         assert_eq!(week.off_hours, 35);
         let body = week.to_mail_body();
@@ -676,24 +588,16 @@ mod tests {
 
     #[test]
     fn fully_off_week_produces_zero_worked_hours() {
-        // Range fully covers week of Aug 10-14 2026. LLM gets 0 worked days → empty schedule.
+        // Range fully covers week of Aug 10-14 2026 → 0 worked days, no lunch slots.
         let off = expand(d(2026, 8, 3), d(2026, 8, 28));
-        let schedule = LlmWeekOutput { days: vec![] };
-        let week = assemble(d(2026, 8, 12), &off, &schedule);
+        let week = assemble(d(2026, 8, 12), &off, &[]);
         assert_eq!(week.total_hours, 0);
         assert_eq!(week.off_hours, 35);
         let body = week.to_mail_body();
         assert!(body.contains("TOTAL DURÉE DE TRAVAIL HEBDOMADAIRE : 0h"));
         assert!(body.contains("TOTAL CONGES HEBDOMADAIRE : 35h"));
-        // Every day must be a Congé line, no schedule
+        // Every day must be a Congé line, no lunch
         assert_eq!(body.matches("Congé").count(), 5);
-    }
-
-    #[test]
-    fn prompt_for_fully_off_week_requests_zero_days() {
-        let off = expand(d(2026, 8, 3), d(2026, 8, 28));
-        let prompt = build_llm_prompt(d(2026, 8, 12), &off);
-        assert!(prompt.contains("0 jours"));
     }
 
     #[test]
@@ -708,11 +612,7 @@ mod tests {
     #[test]
     fn mail_body_format_with_holiday_and_personal_off() {
         // Week of May 11 2026: Thu = Ascension (férié), Fri = perso off
-        let schedule = make_schedule(&[
-            ("12h00", "13h00"),
-            ("12h30", "13h30"),
-            ("13h00", "14h00"),
-        ]);
+        let schedule = make_schedule(&[("12h00", "13h00"), ("12h30", "13h30"), ("13h00", "14h00")]);
         let week = assemble(d(2026, 5, 12), &[d(2026, 5, 15)], &schedule);
         let body = week.to_mail_body();
         assert!(body.contains("Jeudi 14 mai - Férié (Ascension)"));

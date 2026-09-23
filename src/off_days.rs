@@ -35,16 +35,12 @@ struct OffDaysFile {
     entries: Vec<OffEntry>,
 }
 
-/// Resolve the on-disk location. Daemon and CLI must agree regardless of CWD,
-/// so we anchor on `$HOME` (override with `PRESENCE_OFF_DAYS_FILE` for tests).
+/// `~/.presence/off_days.json` — daemon and CLI must agree regardless of CWD
+/// (override with `PRESENCE_OFF_DAYS_FILE` for tests).
 fn default_path() -> PathBuf {
-    if let Ok(p) = std::env::var("PRESENCE_OFF_DAYS_FILE") {
-        return PathBuf::from(p);
-    }
-    if let Some(home) = std::env::var_os("HOME") {
-        return PathBuf::from(home).join(".presence").join("off_days.json");
-    }
-    PathBuf::from("off_days.json")
+    std::env::var_os("PRESENCE_OFF_DAYS_FILE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| crate::config::data_dir().join("off_days.json"))
 }
 
 pub fn load() -> Result<Vec<OffEntry>> {
@@ -98,8 +94,7 @@ fn save_to(path: &Path, entries: &[OffEntry]) -> Result<()> {
     sorted.dedup();
     let file = OffDaysFile { entries: sorted };
     let content = serde_json::to_string_pretty(&file)?;
-    std::fs::write(path, content)
-        .with_context(|| format!("failed to write {}", path.display()))?;
+    std::fs::write(path, content).with_context(|| format!("failed to write {}", path.display()))?;
     Ok(())
 }
 

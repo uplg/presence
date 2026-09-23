@@ -1,4 +1,12 @@
 use anyhow::{Context, Result};
+use std::path::PathBuf;
+
+/// `~/.presence`: user data shared by the daemon and the CLI, independent of CWD.
+pub fn data_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(|home| PathBuf::from(home).join(".presence"))
+        .unwrap_or_else(|| PathBuf::from(".presence"))
+}
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -21,8 +29,7 @@ impl Config {
         // readability, but the real secret is the 16 contiguous chars with no
         // whitespace. Strip ALL whitespace so a copy-pasted (and/or quoted)
         // value works — avoids a silent 535 BadCredentials at send time.
-        let gmail_app_password: String =
-            env("GMAIL_APP_PASSWORD")?.split_whitespace().collect();
+        let gmail_app_password: String = env("GMAIL_APP_PASSWORD")?.split_whitespace().collect();
         if gmail_app_password.len() != 16 {
             tracing::warn!(
                 "GMAIL_APP_PASSWORD is {} chars after stripping whitespace (Google App Passwords are 16) — Gmail may reject it",

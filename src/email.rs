@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
-use lettre::message::header::ContentType;
 use lettre::message::Mailbox;
+use lettre::message::header::ContentType;
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 
@@ -26,7 +26,9 @@ pub async fn send(
         builder = builder.to(addr.parse().context("invalid recipient address")?);
     }
 
-    let email = builder.body(body.to_string()).context("failed to build email")?;
+    let email = builder
+        .body(body.to_string())
+        .context("failed to build email")?;
 
     let creds = Credentials::new(from_address.to_string(), app_password.to_string());
 
@@ -35,10 +37,7 @@ pub async fn send(
         .credentials(creds)
         .build();
 
-    mailer
-        .send(email)
-        .await
-        .context("failed to send email")?;
+    mailer.send(email).await.context("failed to send email")?;
 
     Ok(())
 }
