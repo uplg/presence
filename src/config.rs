@@ -14,8 +14,8 @@ pub struct Config {
     pub gmail_app_password: String,
     pub recipient_1: String,
     pub recipient_2: String,
-    pub telegram_bot_token: String,
-    pub telegram_chat_id: String,
+    pub ntfy_topic_url: String,
+    pub ntfy_token: String,
     pub sender_name: String,
 }
 
@@ -42,8 +42,8 @@ impl Config {
             gmail_app_password,
             recipient_1: env("RECIPIENT_1")?,
             recipient_2: env("RECIPIENT_2")?,
-            telegram_bot_token: env("TELEGRAM_BOT_TOKEN")?,
-            telegram_chat_id: env("TELEGRAM_CHAT_ID")?,
+            ntfy_topic_url: env("NTFY_TOPIC_URL")?,
+            ntfy_token: env("NTFY_TOKEN")?,
             sender_name: env("SENDER_NAME")?,
         })
     }

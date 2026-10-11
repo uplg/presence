@@ -1,6 +1,6 @@
 # Presence
 
-Automated weekly time report. Every Friday between 17:10 and 17:30 (Europe/Paris) it emails a work-hours report (9h-17h, 7h/day, 35h/week) with naturally varied lunch breaks via Gmail SMTP, then confirms on Telegram.
+Automated weekly time report. Every Friday between 17:10 and 17:30 (Europe/Paris) it emails a work-hours report (9h-17h, 7h/day, 35h/week) with naturally varied lunch breaks via Gmail SMTP, then confirms on ntfy.
 
 French public holidays are detected automatically ("Férié") and personal off days ("Congé") can be declared from the CLI. Both are deducted from the weekly total.
 
@@ -9,7 +9,7 @@ French public holidays are detected automatically ("Férié") and personal off d
 - macOS (any Mac; nothing is GPU- or model-dependent)
 - Rust toolchain (2024 edition)
 - A Gmail account with an [App Password](https://support.google.com/accounts/answer/185833)
-- A Telegram bot token ([create one via BotFather](https://core.telegram.org/bots#botfather))
+- A private [ntfy](https://ntfy.sh) topic and an access token for it
 
 ## Setup
 
@@ -26,8 +26,8 @@ GMAIL_ADDRESS=you@company.com
 GMAIL_APP_PASSWORD=xxxx-xxxx-xxxx-xxxx
 RECIPIENT_1=boss1@company.com
 RECIPIENT_2=boss2@company.com
-TELEGRAM_BOT_TOKEN=123456:ABC-DEF...
-TELEGRAM_CHAT_ID=123456789
+NTFY_TOPIC_URL=https://ntfy.sh/your-private-topic
+NTFY_TOKEN=tk_your_access_token
 SENDER_NAME="Prénom Nom"
 ```
 
@@ -80,8 +80,8 @@ Public holidays take precedence: a day that is both shows as "Férié (<name>)".
 
 - Sent weeks are recorded in `~/.presence/sent.json`, which prevents double sends.
 - The daemon checks the wall clock every minute, so a Mac that wakes up after 17:10 still sends that Friday evening.
-- If a Friday went by without a send (Mac off, daemon stopped…), the daemon alerts on Telegram as soon as it runs again, with the exact `presence --now --for <date>` command to recover.
-- Any failure during a send (SMTP, off days file…) triggers the same Telegram alert.
+- If a Friday went by without a send (Mac off, daemon stopped…), the daemon alerts on ntfy as soon as it runs again, with the exact `presence --now --for <date>` command to recover.
+- Any failure during a send (SMTP, off days file…) triggers the same ntfy alert.
 
 ## Run as a macOS LaunchAgent
 
@@ -112,7 +112,7 @@ launchctl bootout gui/$(id -u)/com.presence.daemon
 1. On Friday, lunch breaks are drawn for each worked day: 1h breaks starting between 12h00 and 14h00, weighted towards usual times, never the same slot 3 days in a row, never the same slot all week.
 2. The week is assembled with public holidays ("Férié") and personal off days ("Congé").
 3. The report is sent via Gmail SMTP (STARTTLS + App Password) and recorded as sent.
-4. A Telegram message confirms delivery.
+4. An ntfy notification confirms delivery.
 
 ## Email format
 

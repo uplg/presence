@@ -4,7 +4,7 @@ mod holidays;
 mod ledger;
 mod off_days;
 mod report;
-mod telegram;
+mod notify;
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Duration, NaiveDate, NaiveTime, TimeZone, Utc};
@@ -35,7 +35,7 @@ fn build_report(target: NaiveDate) -> Result<report::WeekReport> {
 }
 
 /// Build, email and record the report for the week containing `target`, then
-/// confirm on Telegram. Refuses to send a week twice unless `force`.
+/// confirm on ntfy. Refuses to send a week twice unless `force`.
 async fn send_week(cfg: &config::Config, target: NaiveDate, force: bool) -> Result<()> {
     let monday = report::week_monday(target);
     if !force && ledger::load()?.contains(&monday) {
@@ -57,27 +57,34 @@ async fn send_week(cfg: &config::Config, target: NaiveDate, force: bool) -> Resu
     .await?;
 
     // The email is out: from here on, failures must not trigger a resend.
-    let mut tg_msg = format!(
+    let mut confirmation = format!(
         "Feuille de présence envoyée (semaine du {monday}).\nDestinataires : {}, {}\n\n{mail_body}",
         cfg.recipient_1, cfg.recipient_2
     );
     if let Err(e) = ledger::mark_sent(monday) {
         error!("email sent but failed to record it: {e:#}");
-        tg_msg.push_str(&format!(
+        confirmation.push_str(&format!(
             "\n⚠️ Envoi non enregistré dans le registre : {e:#}"
         ));
     }
-    info!("notifying Telegram...");
-    if let Err(e) = telegram::notify(&cfg.telegram_bot_token, &cfg.telegram_chat_id, &tg_msg).await
+    info!("notifying ntfy...");
+    if let Err(e) = notify::notify(
+        &cfg.ntfy_topic_url,
+        &cfg.ntfy_token,
+        "Feuille de présence envoyée",
+        &confirmation,
+        false,
+    )
+    .await
     {
-        error!("email sent but Telegram confirmation failed: {e:#}");
+        error!("email sent but the ntfy confirmation failed: {e:#}");
     }
 
     info!("done");
     Ok(())
 }
 
-/// Send `target`'s week; on ANY failure log it and push a Telegram alert
+/// Send `target`'s week; on ANY failure log it and push an ntfy alert
 /// containing the exact recovery command. Returns whether it succeeded.
 async fn send_week_or_alert(cfg: &config::Config, target: NaiveDate, force: bool) -> bool {
     let Err(e) = send_week(cfg, target, force).await else {
@@ -99,8 +106,8 @@ async fn send_week_or_alert(cfg: &config::Config, target: NaiveDate, force: bool
 }
 
 async fn alert(cfg: &config::Config, msg: &str) {
-    if let Err(e) = telegram::notify(&cfg.telegram_bot_token, &cfg.telegram_chat_id, msg).await {
-        error!("failed to send Telegram alert: {e:#}");
+    if let Err(e) = notify::notify(&cfg.ntfy_topic_url, &cfg.ntfy_token, "Presence : action requise", msg, true).await {
+        error!("failed to send the ntfy alert: {e:#}");
     }
 }
 
